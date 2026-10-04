@@ -133,8 +133,17 @@ async function submitRecovery() {
     });
     const data = await resp.json();
     if (resp.ok && data.status === "accepted") {
-      setStatus("ok", `恢复完成，裁决已冻结（auditId=${data.verdict.auditId}）。可随时用该标识重新读取。`);
+      if (data.replayed) {
+        setStatus("info", `语义等价重传：稳定回放首次冻结的裁决（auditId=${data.verdict.auditId}），输入未改变业务内容。`);
+      } else {
+        setStatus("ok", `恢复完成，裁决已冻结（auditId=${data.verdict.auditId}）。可随时用该标识重新读取。`);
+      }
       renderVerdict(data.verdict);
+    } else if (resp.status === 409 || data.status === "conflict") {
+      // Different but valid input under an already-frozen identifier: the
+      // first evidence is kept. Offer it via a lookup.
+      els.verdictCard.classList.add("hidden");
+      setStatus("info", `标识冲突（HTTP 409）：${data.error}`);
     } else {
       els.verdictCard.classList.add("hidden");
       setStatus("err", `稳定拒绝（HTTP ${resp.status}）：${data.error}`);

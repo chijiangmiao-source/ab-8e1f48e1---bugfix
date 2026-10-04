@@ -23,6 +23,7 @@ Deliberately dependency-free (Python standard library only).
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -192,6 +193,78 @@ def parse_record(raw: dict[str, Any], index: int) -> Record:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Semantic canonicalization / fingerprinting
+#
+# A stable audit identifier stands for exactly one definite recovery *input*.
+# Two submissions describe the same input when they carry the same recovery
+# semantics regardless of JSON field order or hexadecimal surface form.  The
+# canonical form therefore:
+#
+#   * drops the routing key ``auditId`` (it identifies *where* evidence is
+#     frozen, not *what* recovery input it is);
+#   * sorts object keys;
+#   * decodes every hex byte string (page data, before/after images) and
+#     re-emits it as lower-case hex without a ``0x`` prefix or whitespace,
+#     so "AA" / "aa" / "0xaa" / " aa " all compare equal.
+#
+# Any genuine business difference (another page, a changed byte, a different
+# LSN/prevLSN/offset/…) changes the fingerprint and is therefore a conflict
+# against an already-frozen identifier rather than an overwrite.
+# ---------------------------------------------------------------------------
+
+_HEX_FIELDS = {"before", "after", "data"}
+
+
+def _canonical_hex(value: Any) -> Any:
+    """Normalize a hex string to lower-case, no-prefix, compact form.
+
+    Non-strings and malformed strings are returned untouched: canonicalization
+    only folds together *valid* surface forms — the recovery validator remains
+    solely responsible for rejecting illegal input, while the fingerprint of
+    even an illegal submission stays deterministic.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text[:2].lower() == "0x":
+        text = text[2:]
+    compact = "".join(text.split()).lower()
+    if compact == "" or not (
+        len(compact) % 2 == 0 and all(c in "0123456789abcdef" for c in compact)
+    ):
+        return value
+    return compact
+
+
+def canonicalize(value: Any, key: Optional[str] = None) -> Any:
+    """Return the semantic-canonical form of a request subtree."""
+    if key in _HEX_FIELDS:
+        return _canonical_hex(value)
+    if isinstance(value, dict):
+        return {
+            k: canonicalize(value[k], k)
+            for k in sorted(value)
+            if k != "auditId"
+        }
+    if isinstance(value, list):
+        return [canonicalize(v) for v in value]
+    return value
+
+
+def semantic_fingerprint(payload: dict[str, Any]) -> str:
+    """Stable SHA-256 over the canonical recovery input (auditId excluded).
+
+    Field order and hex casing never affect the result; malformed hex is left
+    as-is (still deterministic) and rejected later by the recovery validator.
+    """
+    canon = canonicalize(payload)
+    blob = json.dumps(
+        canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _validate_chain(records: list[Record], by_lsn: dict[int, Record], cp: Optional[Record]) -> None:

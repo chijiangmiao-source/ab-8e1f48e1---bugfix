@@ -4,15 +4,25 @@ Run: python -m unittest -v tests.test_recovery
 (no third-party dependencies)
 """
 
+import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
-from recovery import RecoveryError, recover  # noqa: E402
-from storage import AuditStore  # noqa: E402
+from recovery import RecoveryError, recover, semantic_fingerprint  # noqa: E402
+from storage import (  # noqa: E402
+    AuditStore,
+    CONFLICT,
+    FIRST_ACCEPTED,
+    REJECTED_FIRST,
+    REJECTED_REPLACED,
+    REJECTED_SAME,
+    REPLAYED,
+)
 
 ZEROS = "00" * 4096
 
@@ -384,6 +394,51 @@ class StableRejectionTests(unittest.TestCase):
             recover({"pages": [page(0)], "wal": []})
 
 
+class FingerprintTests(unittest.TestCase):
+    def _payload(self, after="aaaaaaaa"):
+        return {
+            "auditId": "fp-id",
+            "pages": [page(1, ZEROS, page_lsn=10)],
+            "wal": [
+                begin(10, "T1"),
+                upd(20, "T1", 10, 1, 0, "00000000", after),
+                commit(30, "T1", 20),
+                end(40, "T1", 30),
+            ],
+        }
+
+    def test_field_order_hex_case_and_prefix_do_not_change_fingerprint(self):
+        base = self._payload()
+        reordered = {
+            "pages": [{"data": "0x" + ZEROS.upper(), "page": 1, "pageLSN": 10}],
+            "auditId": "fp-id",
+            "wal": [
+                {"xid": "T1", "lsn": 10, "type": "begin"},
+                {"after": "AAAAAAAA", "before": "00000000", "offset": 0,
+                 "page": 1, "prevLSN": 10, "xid": "T1", "lsn": 20, "type": "update"},
+                {"lsn": 30, "type": "commit", "xid": "T1", "prevLSN": 20},
+                {"lsn": 40, "type": "end", "xid": "T1", "prevLSN": 30},
+            ],
+        }
+        # Whitespace inside the hex string is also semantically irrelevant.
+        reordered["pages"][0]["data"] = "  " + " ".join(
+            ZEROS[i:i + 2] for i in range(0, len(ZEROS), 2)
+        ) + " "
+        self.assertEqual(semantic_fingerprint(base), semantic_fingerprint(reordered))
+
+    def test_audit_id_is_not_part_of_fingerprint(self):
+        a = self._payload()
+        b = json.loads(json.dumps(a))
+        b["auditId"] = "a-different-routing-key"
+        self.assertEqual(semantic_fingerprint(a), semantic_fingerprint(b))
+
+    def test_business_change_changes_fingerprint(self):
+        self.assertNotEqual(
+            semantic_fingerprint(self._payload("aaaaaaaa")),
+            semantic_fingerprint(self._payload("bbbbbbbb")),
+        )
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -394,31 +449,187 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_rejection_clears_prior_success_evidence(self):
-        good_verdict = run("stable-id", [page(1, ZEROS, 10)],
-                           [begin(10, "T1"), upd(20, "T1", 10, 1, 0, "0000", "aaaa"),
-                            commit(30, "T1", 20), end(40, "T1", 30)])
-        self.store.save_accepted("stable-id", {"auditId": "stable-id"}, good_verdict)
+    def _valid(self, audit_id="stable-id", after="aaaaaaaa"):
+        payload = {
+            "auditId": audit_id,
+            "pages": [page(1, ZEROS, page_lsn=10)],
+            "wal": [
+                begin(10, "T1"),
+                upd(20, "T1", 10, 1, 0, "00000000", after),
+                commit(30, "T1", 20),
+                end(40, "T1", 30),
+            ],
+        }
+        verdict = recover(payload)
+        return payload, semantic_fingerprint(payload), verdict
+
+    def _broken_chain(self, audit_id="stable-id"):
+        payload = {
+            "auditId": audit_id,
+            "pages": [page(1, ZEROS, page_lsn=10)],
+            "wal": [begin(10, "T1"),
+                    upd(20, "T1", 999, 1, 0, "00000000", "aaaaaaaa")],
+        }
+        return payload, semantic_fingerprint(payload), "LSN 20 的 prevLSN 999 不存在（断链）"
+
+    def _ended_ref(self, payload):
+        # Formally shaped, but references a transaction that already ended.
+        p = json.loads(json.dumps(payload))
+        p["wal"].append(upd(50, "T1", 40, 1, 4, "0000", "cccc"))
+        return p, semantic_fingerprint(p)
+
+    # ---- lifecycle -------------------------------------------------------
+    def test_first_valid_input_freezes(self):
+        payload, fp, verdict = self._valid()
+        code, row = self.store.resolve("stable-id", payload, fp, verdict, None)
+        self.assertEqual(code, FIRST_ACCEPTED)
+        self.assertEqual(row["status"], "accepted")
+        self.assertEqual(row["fingerprint"], fp)
+
+    def test_semantic_retransmit_replays_first_verdict(self):
+        payload, fp, verdict = self._valid()
+        self.store.resolve("stable-id", payload, fp, verdict, None)
+
+        # Re-send with reordered keys / uppercase hex / 0x prefix.
+        again = {
+            "auditId": "stable-id",
+            "pages": [{"data": "0X" + ZEROS.upper(), "pageLSN": 10, "page": 1}],
+            "wal": [
+                {"type": "begin", "xid": "T1", "lsn": 10},
+                {"type": "update", "xid": "T1", "lsn": 20, "prevLSN": 10,
+                 "page": 1, "offset": 0, "before": "00000000", "after": "AAAAAAAA"},
+                {"type": "commit", "xid": "T1", "prevLSN": 20, "lsn": 30},
+                {"type": "end", "xid": "T1", "prevLSN": 30, "lsn": 40},
+            ],
+        }
+        fp2 = semantic_fingerprint(again)
+        self.assertEqual(fp, fp2)
+        code, row = self.store.resolve(
+            "stable-id", again, fp2, recover(again), None
+        )
+        self.assertEqual(code, REPLAYED)
+        # The replayed verdict is exactly the first frozen one.
+        self.assertEqual(row["verdict"], verdict)
+
+    def test_different_valid_input_is_conflict_and_keeps_first_freeze(self):
+        p1, f1, v1 = self._valid(after="aaaaaaaa")
+        self.store.resolve("stable-id", p1, f1, v1, None)
+        p2, f2, v2 = self._valid(after="bbbbbbbb")
+        self.assertNotEqual(f1, f2)
+
+        code, row = self.store.resolve("stable-id", p2, f2, v2, None)
+        self.assertEqual(code, CONFLICT)
+        # First evidence is untouched: frozen bytes are still those of input 1.
         frozen = self.store.get("stable-id")
         self.assertEqual(frozen["status"], "accepted")
-        self.assertIn("verdict", frozen)
+        self.assertTrue(frozen["verdict"]["pages"][0]["data"].startswith("aaaaaaaa"))
+        self.assertFalse(frozen["verdict"]["pages"][0]["data"].startswith("bbbbbbbb"))
 
-        # Same audit id, now a corrupted predecessor chain -> stable reject.
-        bad_request = {"auditId": "stable-id", "pages": [page(1)],
-                       "wal": [begin(10, "T1"),
-                               upd(20, "T1", 999, 1, 0, "0000", "aaaa")]}
-        self.store.save_rejected("stable-id", bad_request, "LSN 20 的 prevLSN 999 不存在（断链）")
+    def test_rejection_of_different_input_clears_prior_success(self):
+        p1, f1, v1 = self._valid()
+        self.store.resolve("stable-id", p1, f1, v1, None)
+
+        bad, fbad, err = self._broken_chain()
+        self.assertNotEqual(f1, fbad)
+        code, row = self.store.resolve("stable-id", bad, fbad, None, err)
+        self.assertEqual(code, REJECTED_REPLACED)
+        self.assertEqual(row["status"], "rejected")
+        self.assertNotIn("verdict", row)
 
         after = self.store.get("stable-id")
         self.assertEqual(after["status"], "rejected")
         self.assertNotIn("verdict", after)
         self.assertIn("断链", after["error"])
 
+    def test_ended_transaction_reference_is_rejected_and_clears_evidence(self):
+        p1, f1, v1 = self._valid()
+        self.store.resolve("stable-id", p1, f1, v1, None)
+
+        ended, fended = self._ended_ref(p1)
+        with self.assertRaises(RecoveryError) as ctx:
+            recover(ended)
+        self.assertIn("已结束事务", str(ctx.exception))
+        code, row = self.store.resolve(
+            "stable-id", ended, fended, None, str(ctx.exception)
+        )
+        self.assertEqual(code, REJECTED_REPLACED)
+        self.assertEqual(row["status"], "rejected")
+        self.assertNotIn("verdict", self.store.get("stable-id"))
+
+    def test_repeated_identical_rejection_is_stable(self):
+        bad, fbad, err = self._broken_chain()
+        code, _ = self.store.resolve("stable-id", bad, fbad, None, err)
+        self.assertEqual(code, REJECTED_FIRST)
+        code, row = self.store.resolve("stable-id", bad, fbad, None, err)
+        self.assertEqual(code, REJECTED_SAME)
+        self.assertEqual(row["status"], "rejected")
+
+    def test_valid_after_rejection_freezes_fresh(self):
+        bad, fbad, err = self._broken_chain()
+        self.store.resolve("stable-id", bad, fbad, None, err)
+        p1, f1, v1 = self._valid()
+        code, row = self.store.resolve("stable-id", p1, f1, v1, None)
+        self.assertEqual(code, FIRST_ACCEPTED)
+        self.assertEqual(row["status"], "accepted")
+
     def test_unrelated_audit_survives_other_rejection(self):
-        self.store.save_accepted("keep", {}, {"auditId": "keep"})
-        self.store.save_rejected("drop", {}, "bad")
+        pk, fk, vk = self._valid("keep")
+        self.store.resolve("keep", pk, fk, vk, None)
+        bd, fb, err = self._broken_chain("drop")
+        self.store.resolve("drop", bd, fb, None, err)
         self.assertEqual(self.store.get("keep")["status"], "accepted")
         self.assertEqual(self.store.get("drop")["status"], "rejected")
+
+    # ---- persistence across reopen --------------------------------------
+    def test_decisions_survive_store_reopen(self):
+        p1, f1, v1 = self._valid("persist")
+        self.store.resolve("persist", p1, f1, v1, None)
+        bad, fbad, err = self._broken_chain("rejected-id")
+        self.store.resolve("rejected-id", bad, fbad, None, err)
+        self.store.close()
+
+        reopened = AuditStore(self.db)
+        try:
+            # Same input still replays; different valid input still conflicts.
+            code, row = reopened.resolve("persist", p1, f1, v1, None)
+            self.assertEqual(code, REPLAYED)
+            other, fother, vother = self._valid("persist", after="cccccccc")
+            code, _ = reopened.resolve("persist", other, fother, vother, None)
+            self.assertEqual(code, CONFLICT)
+            self.assertEqual(reopened.get("persist")["status"], "accepted")
+            # The rejection record is still present.
+            self.assertEqual(reopened.get("rejected-id")["status"], "rejected")
+        finally:
+            reopened.close()
+
+    # ---- concurrency -----------------------------------------------------
+    def test_concurrent_different_valid_first_submissions_only_one_freezes(self):
+        p1, f1, v1 = self._valid("race", after="aaaaaaaa")
+        p2, f2, v2 = self._valid("race", after="bbbbbbbb")
+        outcomes = []
+
+        def worker(payload, fp, verdict):
+            # A fresh connection per thread, mirroring two HTTP workers that
+            # share the same database file.
+            store = AuditStore(self.db)
+            try:
+                barrier.wait()
+                code, _ = store.resolve("race", payload, fp, verdict, None)
+                outcomes.append(code)
+            finally:
+                store.close()
+
+        barrier = threading.Barrier(2)
+        t1 = threading.Thread(target=worker, args=(p1, f1, v1))
+        t2 = threading.Thread(target=worker, args=(p2, f2, v2))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(sorted(outcomes), sorted([FIRST_ACCEPTED, CONFLICT]))
+        frozen = self.store.get("race")
+        self.assertEqual(frozen["status"], "accepted")
+        # Exactly one of the two business contents is frozen, never a mix.
+        head = frozen["verdict"]["pages"][0]["data"][:8]
+        self.assertIn(head, {"aaaaaaaa", "bbbbbbbb"})
 
 
 if __name__ == "__main__":

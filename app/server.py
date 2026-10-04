@@ -5,9 +5,15 @@ Endpoints
 GET  /                      browser UI
 GET  /static/*              static assets
 GET  /healthz               health response (JSON)
-POST /api/recover           submit pages + WAL; returns a frozen verdict or a
-                            stable rejection (HTTP 422).  A rejection for an
-                            audit id removes any previously frozen success.
+POST /api/recover           submit pages + WAL.  Every request is validated in
+                            full first; the store then atomically decides:
+                              * first valid input  -> freeze verdict (200)
+                              * semantically equal retransmit -> replay the
+                                first frozen verdict (200, replayed=true)
+                              * different but valid input -> identifier
+                                conflict, first evidence kept (409)
+                              * invalid input -> stable rejection (422) and
+                                any prior success evidence is cleared.
 GET  /api/audit?auditId=..  read the frozen verdict / rejection
 GET  /api/sample            a ready-to-use demo payload
 
@@ -27,8 +33,16 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from recovery import RecoveryError, recover  # noqa: E402
-from storage import AuditStore  # noqa: E402
+from recovery import (  # noqa: E402
+    RecoveryError,
+    recover,
+    semantic_fingerprint,
+)
+from storage import (  # noqa: E402
+    AuditStore,
+    CONFLICT,
+    REPLAYED,
+)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MAX_BODY = 8 * 1024 * 1024  # 8 MiB cap on a single submission
@@ -91,22 +105,6 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[http] %s - %s\n" % (self.address_string(), fmt % args))
 
-    def _send_accepted_replay(self, audit_id: str) -> bool:
-        if not audit_id:
-            return False
-        cached = self.store.get_accepted_replay(audit_id)
-        if cached is None:
-            return False
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "status": "accepted",
-                "replayed": True,
-                "verdict": cached["verdict"],
-            },
-        )
-        return True
-
     # ---- routing ---------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -161,31 +159,82 @@ class Handler(BaseHTTPRequestHandler):
 
         audit_id = payload.get("auditId") if isinstance(payload, dict) else None
         audit_id = audit_id.strip() if isinstance(audit_id, str) else ""
-
-        if self._send_accepted_replay(audit_id):
+        if not audit_id:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "缺少稳定审计标识 auditId"}
+            )
             return
 
+        # Every submission — even for an identifier that already has frozen
+        # evidence — goes through the full recovery validation.  Nothing is
+        # short-circuited to an earlier verdict before the new input has
+        # itself been checked.  The fingerprint is always computable (it is
+        # deterministic even for malformed input).
+        fingerprint = semantic_fingerprint(payload)
         try:
             verdict = recover(payload)
         except RecoveryError as exc:
             # Stable rejection: persist and clear any prior success evidence.
-            if audit_id:
-                try:
-                    self.store.save_rejected(audit_id, payload, str(exc))
-                except Exception:  # pragma: no cover - storage failure must not mask verdict
-                    traceback.print_exc()
+            try:
+                self.store.resolve(audit_id, payload, fingerprint, None, str(exc))
+            except Exception:  # pragma: no cover - storage must not mask verdict
+                traceback.print_exc()
             self._send_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
-                {"status": "rejected", "auditId": audit_id or None, "error": str(exc)},
+                {"status": "rejected", "auditId": audit_id, "error": str(exc)},
             )
             return
         except Exception as exc:  # internal error must never look like a verdict
             traceback.print_exc()
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"服务内部错误：{exc}"})
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"服务内部错误：{exc}"},
+            )
             return
 
-        self.store.save_accepted(verdict["auditId"], payload, verdict)
-        self._send_json(HTTPStatus.OK, {"status": "accepted", "verdict": verdict})
+        # The input is valid.  Atomically decide freeze / replay / conflict.
+        try:
+            code, row = self.store.resolve(audit_id, payload, fingerprint, verdict, None)
+        except Exception as exc:  # pragma: no cover
+            traceback.print_exc()
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"服务内部错误：{exc}"},
+            )
+            return
+
+        if code == CONFLICT:
+            # A different, itself valid recovery history under an id whose
+            # first valid input is already frozen: keep that evidence.
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "status": "conflict",
+                    "auditId": audit_id,
+                    "error": (
+                        f"稳定审计标识 {audit_id} 已冻结另一份不同的合法恢复输入；"
+                        "首份证据保持不变，本次不同的合法恢复历史判为标识冲突"
+                    ),
+                },
+            )
+            return
+
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "status": "accepted",
+                "replayed": code == REPLAYED,
+                "verdict": row["verdict"],
+            },
+        )
+
+
+class AuditHTTPServer(ThreadingHTTPServer):
+    # Bursts of concurrent first-submissions must not overflow the accept
+    # queue (the default backlog is only 5); worker threads are daemons so
+    # a hung client never blocks shutdown.
+    request_queue_size = 128
+    daemon_threads = True
 
 
 def main() -> None:
@@ -193,7 +242,7 @@ def main() -> None:
     port = int(os.environ.get("PORT", "8080"))
     db_path = os.environ.get("AUDIT_DB", "/data/audit.db")
     Handler.store = AuditStore(db_path)
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = AuditHTTPServer((host, port), Handler)
     print(f"[http] recovery audit listening on {host}:{port} (db={db_path})", flush=True)
     try:
         server.serve_forever()
