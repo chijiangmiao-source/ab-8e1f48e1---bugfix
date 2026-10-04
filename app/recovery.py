@@ -23,6 +23,7 @@ Deliberately dependency-free (Python standard library only).
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -35,7 +36,16 @@ TERMINATORS = {"commit", "abort"}
 
 
 class RecoveryError(ValueError):
-    """Stable rejection: the recovery request is invalid and must not run."""
+    """Stable rejection: the recovery request is invalid and must not run.
+
+    The optional *fingerprint* carries the semantic fingerprint of the
+    structurally parsed input, so even inputs that later fail chain /
+    lifecycle validation can be stably replayed across restarts.
+    """
+
+    def __init__(self, message: str, fingerprint: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.fingerprint = fingerprint
 
 
 @dataclass
@@ -192,6 +202,69 @@ def parse_record(raw: dict[str, Any], index: int) -> Record:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _canon_hex(raw: bytes) -> str:
+    """Canonical spelling of byte data: lower-case hex, no 0x prefix."""
+    return raw.hex()
+
+
+def _canon_record(rec: Record) -> dict[str, Any]:
+    """Canonical, semantics-only shape of one WAL record.
+
+    Field spelling that does not change recovery semantics (JSON key
+    ordering, hex case, an 0x prefix) is normalized away.
+    """
+    out: dict[str, Any] = {
+        "lsn": rec.lsn,
+        "type": rec.kind,
+        "xid": rec.xid,
+    }
+    if rec.kind == "checkpoint":
+        out["transactions"] = {x: rec.cp_txn[x] for x in sorted(rec.cp_txn)}
+        out["dirtyPages"] = {str(p): rec.cp_dirty[p] for p in sorted(rec.cp_dirty)}
+        return out
+    if rec.prev_lsn is not None:
+        out["prevLSN"] = rec.prev_lsn
+    if rec.kind == "update":
+        out.update(
+            page=rec.page,
+            offset=rec.offset,
+            length=rec.length,
+            before=_canon_hex(rec.before),
+            after=_canon_hex(rec.after),
+        )
+    return out
+
+
+def _canon_payload(pages: dict[int, PageState],
+                   records: list[Record]) -> dict[str, Any]:
+    """Deterministic representation of the whole recovery input.
+
+    Independent of: JSON object key order, hex digit case / 0x prefix, and
+    the order in which crashed page images are listed.  The stable audit
+    identifier (the storage key) is deliberately excluded: the fingerprint
+    identifies the recovery input itself (pages + WAL).
+    """
+    canon_pages = [
+        {
+            "page": pno,
+            "pageLSN": pages[pno].initial_lsn,
+            "data": _canon_hex(pages[pno].initial_data),
+        }
+        for pno in sorted(pages)
+    ]
+    return {
+        "pages": canon_pages,
+        "wal": [_canon_record(r) for r in records],
+    }
+
+
+def input_fingerprint(canon: Any) -> str:
+    """Stable SHA-256 over the canonical recovery input."""
+    blob = json.dumps(canon, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+    return _sha256(blob)
 
 
 def _validate_chain(records: list[Record], by_lsn: dict[int, Record], cp: Optional[Record]) -> None:
@@ -369,23 +442,38 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
     # ---- parse records ---------------------------------------------------
     records: list[Record] = [parse_record(r, i) for i, r in enumerate(wal_raw)]
 
+    # Semantic fingerprint of the structurally parsed recovery input.  It is
+    # computed before ordering/chain validation so even inputs that fail
+    # those checks carry a stable fingerprint for replay, and it is part of
+    # every frozen success verdict.  Field spelling that carries no business
+    # meaning (JSON key order, hex-letter case, an 0x prefix, the order the
+    # crashed page images are listed) is normalized away.
+    canon = _canon_payload(pages, records)
+    fingerprint = input_fingerprint(canon)
+
     by_lsn: dict[int, Record] = {}
     for rec in records:
         if rec.lsn in by_lsn:
-            raise RecoveryError(f"检测到重复 LSN {rec.lsn}")
+            raise RecoveryError(f"检测到重复 LSN {rec.lsn}", fingerprint)
         by_lsn[rec.lsn] = rec
 
     for a, b in zip(records, records[1:]):
         if b.lsn <= a.lsn:
             raise RecoveryError(
-                f"WAL 必须严格按 LSN 升序排列：LSN {a.lsn} 之后出现 {b.lsn}"
+                f"WAL 必须严格按 LSN 升序排列：LSN {a.lsn} 之后出现 {b.lsn}",
+                fingerprint,
             )
 
     checkpoints = [r for r in records if r.kind == "checkpoint"]
     if len(checkpoints) > 1:
-        raise RecoveryError("至多允许一条 checkpoint 记录")
+        raise RecoveryError("至多允许一条 checkpoint 记录", fingerprint)
     cp = checkpoints[0] if checkpoints else None
-    _validate_chain(records, by_lsn, cp)
+    try:
+        _validate_chain(records, by_lsn, cp)
+    except RecoveryError as exc:
+        if exc.fingerprint is None:
+            exc.fingerprint = fingerprint
+        raise
 
     trace: list[dict[str, Any]] = []
 
@@ -546,7 +634,8 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
             raise RecoveryError(
                 f"重做 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时，"
                 f"区间 [{rec.offset},{rec.offset + rec.length}) 当前字节既非 before 也非 after"
-                " —— 错误前像，稳定拒绝"
+                " —— 错误前像，稳定拒绝",
+                fingerprint,
             )
 
         trace.append(
@@ -598,7 +687,7 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         lsn = undo_stack.pop(0)
         rec = by_lsn.get(lsn)
         if rec is None:
-            raise RecoveryError(f"撤销链遇到不存在的 LSN {lsn}（断链）")
+            raise RecoveryError(f"撤销链遇到不存在的 LSN {lsn}（断链）", fingerprint)
         if rec.kind != "update":
             if rec.kind == "begin":
                 # Reached the transaction's begin: this chain ends.
@@ -643,14 +732,16 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         if st.page_lsn != rec.lsn:
             raise RecoveryError(
                 f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时页 LSN 条件不满足："
-                f"当前 pageLSN={st.page_lsn}，期望 {rec.lsn}（只在条件满足时改写页像）"
+                f"当前 pageLSN={st.page_lsn}，期望 {rec.lsn}（只在条件满足时改写页像）",
+                fingerprint,
             )
         interval = bytes(st.data[rec.offset : rec.offset + rec.length])
         if interval != rec.after:
             raise RecoveryError(
                 f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时，"
                 f"区间 [{rec.offset},{rec.offset + rec.length}) 当前字节不是 after 镜像"
-                " —— 错误前像，稳定拒绝"
+                " —— 错误前像，稳定拒绝",
+                fingerprint,
             )
         st.data[rec.offset : rec.offset + rec.length] = rec.before
         st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
@@ -702,6 +793,7 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "auditId": audit_id,
+        "inputFingerprint": fingerprint,
         "committedTransactions": committed,
         "abortedTransactions": aborted,
         "loserTransactions": sorted(losers),

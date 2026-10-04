@@ -43,15 +43,21 @@ function shortSha(sha) {
   return `${sha.slice(0, 16)}…${sha.slice(-8)}`;
 }
 
-function renderVerdict(v) {
+function renderVerdict(v, banner) {
   window._lastTrace = v.trace;
   els.verdictCard.classList.remove("hidden");
   const dptText = Object.entries(v.dirtyPageTableAtEnd)
     .map(([p, l]) => `${p}:${l}`)
     .join(", ") || "∅（全部已落盘）";
+  const bannerHtml = banner
+    ? `<div class="banner ${banner.kind}">${esc(banner.text)}</div>`
+    : "";
   els.verdictSummary.innerHTML = `
+    ${bannerHtml}
     <div class="summ-grid">
       <div class="summ-item"><div class="k">审计标识</div><div class="v">${esc(v.auditId)}</div></div>
+      <div class="summ-item"><div class="k">恢复输入指纹 SHA-256</div>
+        <div class="v monospace" style="font-size:12px" title="${esc(v.inputFingerprint || "")}">${esc((v.inputFingerprint || "—").slice(0, 32))}…</div></div>
       <div class="summ-item"><div class="k">已提交事务</div><div class="v">${esc(v.committedTransactions.join(", ") || "—")}</div></div>
       <div class="summ-item"><div class="k">显式 abort 事务</div><div class="v">${esc(v.abortedTransactions.join(", ") || "—")}</div></div>
       <div class="summ-item"><div class="k">失败（撤销）事务</div><div class="v">${esc(v.loserTransactions.join(", ") || "—")}</div></div>
@@ -133,8 +139,29 @@ async function submitRecovery() {
     });
     const data = await resp.json();
     if (resp.ok && data.status === "accepted") {
-      setStatus("ok", `恢复完成，裁决已冻结（auditId=${data.verdict.auditId}）。可随时用该标识重新读取。`);
-      renderVerdict(data.verdict);
+      if (data.outcome === "replayed") {
+        setStatus("ok", `语义等价重传（HTTP 200）：已稳定回放该标识最先冻结的裁决（auditId=${data.verdict.auditId}）。`);
+        renderVerdict(data.verdict, {
+          kind: "info",
+          text: "重传回放：本次输入与最先冻结的恢复输入语义等价（字段顺序 / 十六进制大小写不影响业务语义），回放首次裁决，证据未被修改。",
+        });
+      } else {
+        setStatus("ok", `恢复成功，裁决已首次冻结（auditId=${data.verdict.auditId}）。可随时用该标识重新读取。`);
+        renderVerdict(data.verdict, {
+          kind: "ok",
+          text: "首次冻结成功：该稳定审计标识自此只代表这一份确定的恢复输入。",
+        });
+      }
+    } else if (data.status === "conflict") {
+      setStatus("warn", `标识冲突（HTTP 409）：${data.error}`);
+      if (data.verdict) {
+        renderVerdict(data.verdict, {
+          kind: "warn",
+          text: "标识冲突：本次是业务内容不同的合法恢复历史；最先冻结的审计证据保持不变，本次输入未覆盖任何字段。",
+        });
+      } else {
+        els.verdictCard.classList.add("hidden");
+      }
     } else {
       els.verdictCard.classList.add("hidden");
       setStatus("err", `稳定拒绝（HTTP ${resp.status}）：${data.error}`);

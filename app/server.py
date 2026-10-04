@@ -5,10 +5,16 @@ Endpoints
 GET  /                      browser UI
 GET  /static/*              static assets
 GET  /healthz               health response (JSON)
-POST /api/recover           submit pages + WAL; returns a frozen verdict or a
-                            stable rejection (HTTP 422).  A rejection for an
-                            audit id removes any previously frozen success.
-GET  /api/audit?auditId=..  read the frozen verdict / rejection
+POST /api/recover           submit pages + WAL.  Every request is fully
+                            validated by the recovery engine first; the store
+                            then atomically decides the outcome:
+                              200 frozen   — first success for the auditId
+                              200 replayed — semantically identical retransmit
+                              409 conflict — different valid history, the first
+                                             frozen evidence is kept
+                              422 rejected — validation failed; any earlier
+                                             success evidence is cleared
+GET  /api/audit?auditId=..  read the frozen verdict / rejection / conflict
 GET  /api/sample            a ready-to-use demo payload
 
 Standard library only.
@@ -16,6 +22,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -91,22 +98,6 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[http] %s - %s\n" % (self.address_string(), fmt % args))
 
-    def _send_accepted_replay(self, audit_id: str) -> bool:
-        if not audit_id:
-            return False
-        cached = self.store.get_accepted_replay(audit_id)
-        if cached is None:
-            return False
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "status": "accepted",
-                "replayed": True,
-                "verdict": cached["verdict"],
-            },
-        )
-        return True
-
     # ---- routing ---------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -150,7 +141,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "空请求体"})
             return
         if length > MAX_BODY:
-            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "请求体超过 8 MiB 上限"})
+            self._send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "请求体超过 8 MiB 上限"}
+            )
             return
         raw = self.rfile.read(length)
         try:
@@ -162,30 +155,152 @@ class Handler(BaseHTTPRequestHandler):
         audit_id = payload.get("auditId") if isinstance(payload, dict) else None
         audit_id = audit_id.strip() if isinstance(audit_id, str) else ""
 
-        if self._send_accepted_replay(audit_id):
-            return
-
+        # Every submission — including repeat submissions of a frozen id —
+        # must actually go through recovery validation.  Nothing is replayed
+        # before the engine has spoken.
         try:
             verdict = recover(payload)
         except RecoveryError as exc:
-            # Stable rejection: persist and clear any prior success evidence.
-            if audit_id:
-                try:
-                    self.store.save_rejected(audit_id, payload, str(exc))
-                except Exception:  # pragma: no cover - storage failure must not mask verdict
-                    traceback.print_exc()
-            self._send_json(
-                HTTPStatus.UNPROCESSABLE_ENTITY,
-                {"status": "rejected", "auditId": audit_id or None, "error": str(exc)},
-            )
-            return
+            return self._handle_invalid(audit_id, payload, exc)
         except Exception as exc:  # internal error must never look like a verdict
             traceback.print_exc()
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"服务内部错误：{exc}"})
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"服务内部错误：{exc}"}
+            )
             return
 
-        self.store.save_accepted(verdict["auditId"], payload, verdict)
-        self._send_json(HTTPStatus.OK, {"status": "accepted", "verdict": verdict})
+        audit_id = verdict["auditId"]
+        fingerprint = verdict["inputFingerprint"]
+        try:
+            outcome, frozen_verdict, frozen_error = self.store.submit(
+                audit_id, payload, verdict, fingerprint
+            )
+        except Exception as exc:  # pragma: no cover
+            traceback.print_exc()
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"存储失败：{exc}"}
+            )
+            return
+
+        if outcome == "frozen":
+            self._send_json(
+                HTTPStatus.OK,
+                {"status": "accepted", "outcome": "frozen", "verdict": verdict},
+            )
+            return
+        if outcome == "replayed":
+            # Semantically identical retransmission (field order / hex case
+            # may differ): replay the originally frozen verdict.
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "accepted",
+                    "outcome": "replayed",
+                    "replayed": True,
+                    "verdict": frozen_verdict,
+                },
+            )
+            return
+
+        # The identifier is already bound to a different frozen history.
+        if frozen_verdict is not None:
+            body = {
+                "status": "conflict",
+                "outcome": "conflict",
+                "auditId": audit_id,
+                "error": (
+                    f"审计标识 {audit_id} 已冻结另一份恢复输入（指纹 "
+                    f"{frozen_verdict.get('inputFingerprint', '')[:16]}…）；"
+                    "本次为业务内容不同的合法恢复历史，判定为标识冲突，"
+                    "最先冻结的审计证据保持不变。"
+                ),
+                "frozenFingerprint": frozen_verdict.get("inputFingerprint"),
+                "submittedFingerprint": fingerprint,
+                "verdict": frozen_verdict,
+            }
+        else:
+            # The id was frozen with a stable rejection of a different input.
+            body = {
+                "status": "conflict",
+                "outcome": "conflict",
+                "auditId": audit_id,
+                "error": (
+                    f"审计标识 {audit_id} 已冻结另一份（被稳定拒绝的）恢复历史；"
+                    f"本次合法恢复历史判为标识冲突，冻结记录保持不变。"
+                    f"既有拒绝原因：{frozen_error}"
+                ),
+                "submittedFingerprint": fingerprint,
+            }
+        self._send_json(HTTPStatus.CONFLICT, body)
+
+    def _handle_invalid(self, audit_id: str, payload: Any,
+                        exc: RecoveryError) -> None:
+        """Persist and answer a request that failed recovery validation."""
+        fingerprint = getattr(exc, "fingerprint", None)
+        if fingerprint is None:
+            # Input failed structural parsing (so the engine could not build
+            # its semantic fingerprint): fall back to a canonical hash of the
+            # raw JSON, so an identical malformed retransmission still
+            # replays stably instead of looking like a new conflict.
+            try:
+                fingerprint = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, ValueError):
+                fingerprint = None
+        if not audit_id:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"status": "rejected", "outcome": "rejected",
+                 "auditId": None, "error": str(exc)},
+            )
+            return
+        try:
+            outcome, frozen_verdict, stored_error = self.store.submit_rejected(
+                audit_id, payload, str(exc), fingerprint
+            )
+        except Exception:  # pragma: no cover - storage must not mask the verdict
+            traceback.print_exc()
+            outcome, frozen_verdict, stored_error = "rejected", None, str(exc)
+
+        if outcome == "replayed":
+            if frozen_verdict is not None:
+                # The frozen input rejected on a later pass: keep history.
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"status": "accepted", "outcome": "replayed",
+                     "replayed": True, "verdict": frozen_verdict},
+                )
+                return
+            # Identical retransmission of a frozen rejection: same 422.
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"status": "rejected", "outcome": "replayed",
+                 "auditId": audit_id, "error": stored_error},
+            )
+            return
+
+        if outcome == "conflict":
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"status": "conflict", "outcome": "conflict",
+                 "auditId": audit_id,
+                 "error": (
+                     f"审计标识 {audit_id} 已冻结另一份被稳定拒绝的恢复历史；"
+                     "本次输入不同，判为标识冲突，冻结记录保持不变。"
+                     f"既有拒绝原因：{stored_error}"
+                 )},
+            )
+            return
+
+        # rejected (first record) or rejection_recorded (a former success was
+        # cleared in the same transaction and replaced by this rejection).
+        self._send_json(
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            {"status": "rejected", "outcome": outcome,
+             "auditId": audit_id, "error": str(exc)},
+        )
 
 
 def main() -> None:

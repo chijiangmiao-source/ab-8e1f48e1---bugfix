@@ -92,6 +92,14 @@ textarea:focus { outline: none; border-color: var(--accent); }
 .status.ok { color: var(--ok); }
 .status.err { color: var(--err); }
 .status.info { color: var(--warn); }
+.status.warn { color: var(--warn); }
+.banner {
+  border-radius: 8px; padding: 8px 12px; margin: 0 0 10px;
+  font-size: 13px; border: 1px solid;
+}
+.banner.ok { background: rgba(52,211,153,0.12); border-color: var(--ok); color: var(--ok); }
+.banner.info { background: rgba(251,191,36,0.10); border-color: var(--warn); color: var(--warn); }
+.banner.warn { background: rgba(248,113,113,0.10); border-color: var(--err); color: var(--err); }
 .hidden { display: none; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
 .table-wrap.tall { max-height: 520px; overflow-y: auto; }

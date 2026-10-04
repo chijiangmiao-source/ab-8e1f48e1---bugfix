@@ -4,15 +4,25 @@ Run: python -m unittest -v tests.test_recovery
 (no third-party dependencies)
 """
 
+import copy
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
-from recovery import RecoveryError, recover  # noqa: E402
-from storage import AuditStore  # noqa: E402
+from recovery import RecoveryError, input_fingerprint, recover  # noqa: E402
+from storage import (  # noqa: E402
+    AuditStore,
+    CONFLICT,
+    FROZEN,
+    REJECTED,
+    REJECTION_RECORDED,
+    REPLAYED,
+    TERMINAL_REJECTION,
+)
 
 ZEROS = "00" * 4096
 
@@ -211,6 +221,66 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(v["pages"][0]["changed"])
 
 
+class FingerprintTests(unittest.TestCase):
+    def _payload(self):
+        return {
+            "auditId": "FP-1",
+            "pages": [page(1, ZEROS, page_lsn=10)],
+            "wal": [
+                begin(10, "T1"),
+                upd(20, "T1", 10, 1, 0, "00000000", "aaaaaaaa"),
+                commit(30, "T1", 20),
+                end(40, "T1", 30),
+            ],
+        }
+
+    def test_verdict_carries_stable_fingerprint(self):
+        v = recover(copy.deepcopy(self._payload()))
+        self.assertEqual(len(v["inputFingerprint"]), 64)
+
+    def test_field_reorder_hex_case_and_page_order_keep_fingerprint(self):
+        base = self._payload()
+        reordered = {
+            "wal": list(reversed(base["wal"])),  # ascending LSN regardless of key order
+            "auditId": "FP-1",
+            "pages": [
+                # reordered keys, upper-case hex, 0x prefix
+                {"data": "0x" + ("00" * 4096).upper(), "page": 1, "pageLSN": 10},
+                page(2, ZEROS),
+            ],
+        }
+        base2 = copy.deepcopy(base)
+        base2["pages"].append(page(2, ZEROS))
+        # page 2 listed before page 1 in this variant
+        reordered["pages"] = [reordered["pages"][1], reordered["pages"][0]]
+        # records with reordered object keys
+        reordered["wal"] = [
+            {"xid": "T1", "type": "begin", "lsn": 10},
+            {"after": "AAAAAAAA", "before": "00000000", "offset": 0, "page": 1,
+             "prevLSN": 10, "xid": "T1", "type": "update", "lsn": 20},
+            {"prevLSN": 20, "xid": "T1", "type": "commit", "lsn": 30},
+            {"lsn": 40, "prevLSN": 30, "xid": "T1", "type": "end"},
+        ]
+        va = recover(base2)
+        vb = recover(reordered)
+        self.assertEqual(va["inputFingerprint"], vb["inputFingerprint"])
+
+    def test_different_business_content_changes_fingerprint(self):
+        a = self._payload()
+        b = copy.deepcopy(a)
+        b["wal"][1]["after"] = "bbbbbbbb"  # different business content
+        self.assertNotEqual(
+            recover(a)["inputFingerprint"], recover(b)["inputFingerprint"]
+        )
+
+    def test_input_fingerprint_helper_stable(self):
+        # Key ordering is irrelevant; the values themselves are taken as-is
+        # (hex-case normalization happens in the recovery canonicalization).
+        canon = {"b": 2, "a": [{"y": 1, "x": "AB"}]}
+        self.assertEqual(input_fingerprint(canon),
+                         input_fingerprint({"a": [{"x": "AB", "y": 1}], "b": 2}))
+
+
 class StableRejectionTests(unittest.TestCase):
     def _base(self):
         return [
@@ -394,31 +464,164 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_rejection_clears_prior_success_evidence(self):
-        good_verdict = run("stable-id", [page(1, ZEROS, 10)],
-                           [begin(10, "T1"), upd(20, "T1", 10, 1, 0, "0000", "aaaa"),
-                            commit(30, "T1", 20), end(40, "T1", 30)])
-        self.store.save_accepted("stable-id", {"auditId": "stable-id"}, good_verdict)
-        frozen = self.store.get("stable-id")
-        self.assertEqual(frozen["status"], "accepted")
-        self.assertIn("verdict", frozen)
+    def _good(self, audit="stable-id", after="aaaa"):
+        verdict = run(audit, [page(1, ZEROS, 10)],
+                      [begin(10, "T1"), upd(20, "T1", 10, 1, 0, "0000", after),
+                       commit(30, "T1", 20), end(40, "T1", 30)])
+        request = {"auditId": audit, "pages": [page(1, ZEROS, 10)],
+                   "wal": [begin(10, "T1"), upd(20, "T1", 10, 1, 0, "0000", after),
+                           commit(30, "T1", 20), end(40, "T1", 30)]}
+        return request, verdict, verdict["inputFingerprint"]
 
-        # Same audit id, now a corrupted predecessor chain -> stable reject.
-        bad_request = {"auditId": "stable-id", "pages": [page(1)],
+    def test_first_success_freezes(self):
+        request, verdict, fp = self._good()
+        outcome, frozen, err = self.store.submit("stable-id", request, verdict, fp)
+        self.assertEqual(outcome, FROZEN)
+        self.assertIsNone(err)
+        row = self.store.get("stable-id")
+        self.assertEqual(row["status"], "accepted")
+        self.assertEqual(row["inputFingerprint"], fp)
+
+    def test_identical_retransmission_replays(self):
+        request, verdict, fp = self._good()
+        self.store.submit("stable-id", request, verdict, fp)
+        outcome, frozen, _ = self.store.submit("stable-id", request, verdict, fp)
+        self.assertEqual(outcome, REPLAYED)
+        self.assertEqual(frozen["inputFingerprint"], fp)
+        # Nothing changed: still one accepted row with the original verdict.
+        self.assertEqual(self.store.get("stable-id")["status"], "accepted")
+
+    def test_different_valid_history_conflicts_and_first_is_kept(self):
+        request1, verdict1, fp1 = self._good(after="aaaa")
+        request2, verdict2, fp2 = self._good(after="bbbb")
+        self.assertNotEqual(fp1, fp2)
+        self.store.submit("stable-id", request1, verdict1, fp1)
+        outcome, frozen, _ = self.store.submit("stable-id", request2, verdict2, fp2)
+        self.assertEqual(outcome, CONFLICT)
+        # The returned evidence is the FIRST verdict, not the challenger.
+        self.assertEqual(frozen["inputFingerprint"], fp1)
+        row = self.store.get("stable-id")
+        self.assertEqual(row["status"], "accepted")
+        self.assertEqual(row["verdict"]["inputFingerprint"], fp1)
+
+    def test_broken_chain_after_success_clears_success_evidence(self):
+        request, verdict, fp = self._good()
+        self.store.submit("stable-id", request, verdict, fp)
+
+        bad_request = {"auditId": "stable-id", "pages": [page(1, ZEROS, 10)],
                        "wal": [begin(10, "T1"),
                                upd(20, "T1", 999, 1, 0, "0000", "aaaa")]}
-        self.store.save_rejected("stable-id", bad_request, "LSN 20 的 prevLSN 999 不存在（断链）")
+        bad_fp = None  # structural fingerprint attached by the engine in real flow
+        # Simulate the engine having produced a fingerprint for the bad input.
+        try:
+            recover(copy.deepcopy(bad_request))
+        except RecoveryError as exc:
+            bad_fp = exc.fingerprint
+        self.assertIsNotNone(bad_fp)
+        self.assertNotEqual(bad_fp, fp)
+
+        outcome, returned_verdict, err = self.store.submit_rejected(
+            "stable-id", bad_request, "LSN 20 的 prevLSN 999 不存在（断链）", bad_fp)
+        self.assertEqual(outcome, REJECTION_RECORDED)
+        self.assertIsNone(returned_verdict)
 
         after = self.store.get("stable-id")
         self.assertEqual(after["status"], "rejected")
         self.assertNotIn("verdict", after)
         self.assertIn("断链", after["error"])
+        self.assertEqual(after["inputFingerprint"], bad_fp)
+
+    def test_rejection_is_terminal_and_identical_rejection_replays(self):
+        bad_request = {"auditId": "r", "pages": [page(1, ZEROS, 10)],
+                       "wal": [begin(10, "T1"),
+                               upd(20, "T1", 999, 1, 0, "0000", "aaaa")]}
+        try:
+            recover(copy.deepcopy(bad_request))
+        except RecoveryError as exc:
+            bad_fp = exc.fingerprint
+        outcome, _, err = self.store.submit_rejected(
+            "r", bad_request, "断链", bad_fp)
+        self.assertEqual(outcome, REJECTED)
+        self.assertIn("断链", err)
+
+        # Same invalid input retransmitted: stable replay of the rejection.
+        outcome, _, err = self.store.submit_rejected(
+            "r", bad_request, "a different error wording must not win", bad_fp)
+        self.assertEqual(outcome, REPLAYED)
+        self.assertEqual(err, "断链")
+
+        # A later *different* valid history cannot overwrite the rejection.
+        request, verdict, fp = self._good(audit="r")
+        outcome, returned, err = self.store.submit("r", request, verdict, fp)
+        self.assertEqual(outcome, TERMINAL_REJECTION)
+        self.assertIsNone(returned)
+        self.assertIn("断链", err)
+        self.assertEqual(self.store.get("r")["status"], "rejected")
+
+    def test_different_rejection_after_rejection_conflicts(self):
+        b1 = {"auditId": "r", "pages": [page(1, ZEROS, 10)],
+              "wal": [begin(10, "T1"), upd(20, "T1", 999, 1, 0, "0000", "aaaa")]}
+        b2 = {"auditId": "r", "pages": [page(1, ZEROS, 10)],
+              "wal": [begin(10, "T1"), upd(20, "T1", 999, 1, 0, "0000", "cccc")]}
+        fp1 = rejection_fp(b1)
+        fp2 = rejection_fp(b2)
+        self.assertNotEqual(fp1, fp2)
+        self.store.submit_rejected("r", b1, "first rejection", fp1)
+        outcome, _, err = self.store.submit_rejected("r", b2, "second rejection", fp2)
+        self.assertEqual(outcome, CONFLICT)
+        self.assertEqual(err, "first rejection")  # first frozen evidence kept
 
     def test_unrelated_audit_survives_other_rejection(self):
-        self.store.save_accepted("keep", {}, {"auditId": "keep"})
-        self.store.save_rejected("drop", {}, "bad")
+        request, verdict, fp = self._good(audit="keep")
+        self.store.submit("keep", request, verdict, fp)
+        self.store.submit_rejected("drop", {}, "bad", "fp-bad")
         self.assertEqual(self.store.get("keep")["status"], "accepted")
         self.assertEqual(self.store.get("drop")["status"], "rejected")
+
+    def test_concurrent_different_first_submissions_only_one_freezes(self):
+        request1, verdict1, fp1 = self._good(audit="race", after="aaaa")
+        request2, verdict2, fp2 = self._good(audit="race", after="bbbb")
+        outcomes = []
+
+        barrier = threading.Barrier(2)
+
+        def worker(req, ver, fp):
+            barrier.wait()
+            outcome, _, _ = self.store.submit("race", req, ver, fp)
+            outcomes.append(outcome)
+
+        t1 = threading.Thread(target=worker, args=(request1, verdict1, fp1))
+        t2 = threading.Thread(target=worker, args=(request2, verdict2, fp2))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(sorted(outcomes), [CONFLICT, FROZEN])
+        row = self.store.get("race")
+        self.assertEqual(row["status"], "accepted")
+        # Exactly one fingerprint won and is now immutable.
+        self.assertIn(row["inputFingerprint"], {fp1, fp2})
+
+    def test_persistence_survives_reopen(self):
+        request, verdict, fp = self._good()
+        self.store.submit("stable-id", request, verdict, fp)
+        self.store.close()
+        reopened = AuditStore(self.db)
+        try:
+            outcome, frozen, _ = reopened.submit(
+                "stable-id", request, verdict, fp)
+            self.assertEqual(outcome, REPLAYED)
+            self.assertEqual(frozen["inputFingerprint"], fp)
+        finally:
+            reopened.close()
+
+
+def rejection_fp(payload):
+    """Run the engine purely to obtain the structural fingerprint of an
+    input that is expected to be rejected."""
+    try:
+        recover(copy.deepcopy(payload))
+    except RecoveryError as exc:
+        return exc.fingerprint
+    raise AssertionError("payload was expected to fail validation")
 
 
 if __name__ == "__main__":
