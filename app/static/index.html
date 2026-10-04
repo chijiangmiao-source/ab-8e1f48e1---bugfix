@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载姿控参数页 · 恢复审计</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>星载姿控参数页恢复审计</h1>
+  <p class="sub">ARIES 分析 / 重做 / 撤销 · 冻结恢复裁决 · 最终页摘要（SHA-256）</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. 提交恢复场景</h2>
+    <label class="field">
+      <span>稳定审计标识 <code>auditId</code></span>
+      <input id="auditId" type="text" maxlength="128" placeholder="例如 AOC-AUDIT-20261004-01">
+    </label>
+
+    <div class="row-between">
+      <span class="hint">至多 48 个初始（崩溃）页像、至多 128 条按 LSN 升序的受限 WAL 记录。
+        记录类型仅含 <code>begin / update / commit / abort / end / checkpoint</code>；
+        <code>update</code> 必须携带 <code>prevLSN、page、offset、before、after</code>（before/after 等长十六进制）。</span>
+      <span class="buttons">
+        <button id="loadSample" type="button">载入样例</button>
+        <button id="formatJson" type="button">格式化 JSON</button>
+      </span>
+    </div>
+    <textarea id="payload" spellcheck="false"></textarea>
+
+    <div class="row-between">
+      <button id="submit" class="primary" type="button">提交并执行恢复</button>
+      <span class="buttons">
+        <input id="lookupId" type="text" placeholder="按 auditId 读取冻结裁决">
+        <button id="lookup" type="button">读取冻结裁决</button>
+      </span>
+    </div>
+    <div id="status" class="status" role="status"></div>
+  </section>
+
+  <section id="verdictCard" class="card hidden">
+    <h2>2. 冻结恢复裁决</h2>
+    <div id="verdictSummary"></div>
+
+    <h3>最终页摘要</h3>
+    <div class="table-wrap">
+      <table id="pagesTable">
+        <thead>
+          <tr>
+            <th>页号</th><th>是否改写</th>
+            <th>恢复前 pageLSN</th><th>恢复后 pageLSN</th>
+            <th>恢复前 SHA-256</th><th>最终 SHA-256</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <h3>逐条恢复流水（分析归属 · 重做/撤销判据）</h3>
+    <div class="filters">
+      <label><input type="checkbox" data-phase="analysis" checked> 分析</label>
+      <label><input type="checkbox" data-phase="redo" checked> 重做</label>
+      <label><input type="checkbox" data-phase="undo" checked> 撤销</label>
+      <label id="onlyChangedWrap"><input type="checkbox" id="onlyChanged"> 仅看实际改写</label>
+    </div>
+    <div class="table-wrap tall">
+      <table id="traceTable">
+        <thead>
+          <tr>
+            <th>阶段</th><th>LSN</th><th>类型</th><th>事务</th><th>页</th>
+            <th>判据 / 分析归属</th><th>裁决</th>
+            <th>pageLSN 前</th><th>pageLSN 后</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>验证规则：断链 · 重复 LSN · 错误前像 · 越界区间 · 已结束事务仍被引用 → 稳定拒绝（HTTP 422）并清除该标识的旧成功证据。</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

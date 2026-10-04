@@ -1,0 +1,38 @@
+services:
+  web:
+    build: .
+    image: aries-recovery-audit:latest
+    container_name: aries-recovery-web
+    environment:
+      # Bind inside the container; the host-side port is mapped below.
+      PORT: "8080"
+      AUDIT_DB: /data/audit.db
+    ports:
+      # Configurable host port: HOST_PORT=9090 docker compose up
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - audit-data:/data
+    restart: unless-stopped
+
+  # One-shot verification container.
+  # Waits for web to become healthy, then runs:
+  #   1. build check (py_compile)
+  #   2. recovery rule tests (committed redo, loser rollback, corrupted
+  #      predecessor chains, all stable-rejection rules)
+  #   3. API/HTTP smoke against the web service
+  # and terminates with its exit code (0 = all passed).
+  # Also invocable directly: docker compose run --rm verify
+  verify:
+    image: aries-recovery-audit:latest
+    build: .
+    container_name: aries-recovery-verify
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SMOKE_BASE_URL: http://web:8080
+    entrypoint: ["bash", "tests/verify.sh"]
+    restart: "no"
+
+volumes:
+  audit-data:
